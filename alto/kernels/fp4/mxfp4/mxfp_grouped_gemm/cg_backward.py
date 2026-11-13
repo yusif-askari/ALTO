@@ -33,6 +33,7 @@ from alto.kernels.fp4.mxfp4.mxfp_quantization import (
 )
 from alto.kernels.dge import dge_bwd
 from alto.kernels.hadamard_transform.transform import (HadamardFactory, HadamardTransform)
+from alto.kernels.fp4.mxfp4._eager_ops import ops
 from alto.kernels.fp4.mxfp4.mxfp_grouped_gemm.wgrad_segmented import _wgrad_seg_kernel, segment_offsets
 from ..macro_block_scaling import macro_block_scaling, macro_block_descaling
 from ...fp4_common.tensor_wrappers import unwrap_weight_wrapper
@@ -459,19 +460,22 @@ def mxfp4_grouped_gemm_backward_weights(
     if expert_indices.dtype != torch.int32:
         expert_indices = expert_indices.to(torch.int32)
 
-    # Create output tensor for gradients
+    # Create output tensor for gradients. The segmented kernel writes every element (an expert without tokens
+    # gets zeros), so it needs no zero fill; the old kernel does.
+    segmented = k_pack_go and k_pack_x and not use_2dblock_go and not use_2dblock_x
+    alloc = torch.empty if segmented else torch.zeros
     if trans_weights:
-        grad_weights = torch.zeros((num_experts, N, K), device=grad_output.device, dtype=output_dtype)
+        grad_weights = alloc((num_experts, N, K), device=grad_output.device, dtype=output_dtype)
         stride_gbe, stride_gbn, stride_gbk = grad_weights.stride()
     else:
-        grad_weights = torch.zeros((num_experts, K, N), device=grad_output.device, dtype=output_dtype)
+        grad_weights = alloc((num_experts, K, N), device=grad_output.device, dtype=output_dtype)
         stride_gbe, stride_gbk, stride_gbn = grad_weights.stride()
     stride_gom, stride_gon = grad_output.stride()
     stride_gosm, stride_gosn = go_scales.stride()
     stride_am, stride_ak = inputs.stride()
     stride_asm, stride_ask = input_scales.stride()
 
-    if k_pack_go and k_pack_x and not use_2dblock_go and not use_2dblock_x:
+    if segmented:
         # Both operands quantized along tokens (1-D blocks): segmented kernel. Each program loops over its own
         # expert's rows only, the token count is a runtime argument (no recompilation per token count) and the
         # tiles are autotuned; 3.5-5x faster than the kernel below on the routed-expert shapes.
@@ -673,13 +677,13 @@ class MXFP4GroupedGEMM(torch.autograd.Function):
             input_mbs = inputs_fwd.new_empty([])
             expert_weights_scaled = expert_weights_fwd
             expert_weight_mbs = expert_weights_fwd.new_empty([])
-        inputs_mxfp4, input_scales = torch.ops.torchtitan.convert_to_mxfp4(
+        inputs_mxfp4, input_scales = ops.convert_to_mxfp4(
             inputs_scaled,
             axis=-1,
             is_2d_block=use_2dblock_x,
             blockscale_selection=blockscale_selection,
         )
-        expert_weights_mxfp4, expert_weight_scales = torch.ops.torchtitan.convert_to_mxfp4(
+        expert_weights_mxfp4, expert_weight_scales = ops.convert_to_mxfp4(
             expert_weights_scaled,
             axis=quant_axis_w,
             is_2d_block=use_2dblock_w,
@@ -688,7 +692,7 @@ class MXFP4GroupedGEMM(torch.autograd.Function):
 
         if is_cdna4():
             assert not use_macro_block_scaling, "Macro block scaling is not supported in real MXFP4 kernels"
-            res = torch.ops.torchtitan.mxfp4_grouped_gemm_forward(
+            res = ops.mxfp4_grouped_gemm_forward(
                 inputs=inputs_mxfp4,
                 expert_weights=expert_weights_mxfp4,
                 expert_indices=expert_indices,
@@ -700,14 +704,14 @@ class MXFP4GroupedGEMM(torch.autograd.Function):
                 output_dtype=original_dtype,
             )
         else:
-            x_dq = torch.ops.torchtitan.convert_from_mxfp4(
+            x_dq = ops.convert_from_mxfp4(
                 inputs_mxfp4,
                 input_scales,
                 original_dtype,
                 axis=-1,
                 is_2d_block=use_2dblock_x,
             )
-            w_dq = torch.ops.torchtitan.convert_from_mxfp4(
+            w_dq = ops.convert_from_mxfp4(
                 expert_weights_mxfp4,
                 expert_weight_scales,
                 original_dtype,
@@ -733,14 +737,14 @@ class MXFP4GroupedGEMM(torch.autograd.Function):
             else:
                 expert_weights_scaled = w_for_dgrad
                 expert_weight_mbs = w_for_dgrad.new_empty([])
-            expert_weights_mxfp4, expert_weight_scales = torch.ops.torchtitan.convert_to_mxfp4(
+            expert_weights_mxfp4, expert_weight_scales = ops.convert_to_mxfp4(
                 expert_weights_scaled,
                 axis=requant_axis_w,
                 is_2d_block=False,
                 blockscale_selection=blockscale_selection,
             )
             if not is_cdna4():
-                w_dq = torch.ops.torchtitan.convert_from_mxfp4(
+                w_dq = ops.convert_from_mxfp4(
                     expert_weights_mxfp4,
                     expert_weight_scales,
                     original_dtype,
@@ -760,7 +764,7 @@ class MXFP4GroupedGEMM(torch.autograd.Function):
             else:
                 inputs_scaled = inputs
                 input_mbs = inputs.new_empty([])
-            inputs_mxfp4, input_scales = torch.ops.torchtitan.convert_to_mxfp4(
+            inputs_mxfp4, input_scales = ops.convert_to_mxfp4(
                 inputs_scaled,
                 axis=0,
                 is_2d_block=False,
@@ -768,7 +772,7 @@ class MXFP4GroupedGEMM(torch.autograd.Function):
                 blockscale_selection=blockscale_selection,
             )
             if not is_cdna4():
-                x_dq = torch.ops.torchtitan.convert_from_mxfp4(
+                x_dq = ops.convert_from_mxfp4(
                     inputs_mxfp4,
                     input_scales,
                     original_dtype,
@@ -823,7 +827,7 @@ class MXFP4GroupedGEMM(torch.autograd.Function):
             else:
                 grad_output_scaled = grad_output
                 grad_output_mbs = grad_output.new_empty([])
-            grad_output_mxfp4, grad_output_scales = torch.ops.torchtitan.convert_to_mxfp4(
+            grad_output_mxfp4, grad_output_scales = ops.convert_to_mxfp4(
                 grad_output_scaled,
                 axis=-1,
                 use_sr=ctx.use_sr_grad,
@@ -834,7 +838,7 @@ class MXFP4GroupedGEMM(torch.autograd.Function):
             grad_output_scales_m = grad_output_scales
 
             if not is_cdna4():
-                grad_output_dq = torch.ops.torchtitan.convert_from_mxfp4(
+                grad_output_dq = ops.convert_from_mxfp4(
                     grad_output_mxfp4,
                     grad_output_scales,
                     ctx.original_dtype,
@@ -856,7 +860,7 @@ class MXFP4GroupedGEMM(torch.autograd.Function):
             else:
                 grad_output_scaled = grad_output_dgrad
                 grad_output_mbs = grad_output_dgrad.new_empty([])
-            grad_output_mxfp4, grad_output_scales = torch.ops.torchtitan.convert_to_mxfp4(
+            grad_output_mxfp4, grad_output_scales = ops.convert_to_mxfp4(
                 grad_output_scaled,
                 axis=-1,
                 use_sr=ctx.use_sr_grad,
@@ -871,7 +875,7 @@ class MXFP4GroupedGEMM(torch.autograd.Function):
             else:
                 grad_output_scaled_m = grad_output
                 grad_output_mbs_m = grad_output.new_empty([])
-            grad_output_mxfp4_m, grad_output_scales_m = torch.ops.torchtitan.convert_to_mxfp4(
+            grad_output_mxfp4_m, grad_output_scales_m = ops.convert_to_mxfp4(
                 grad_output_scaled_m,
                 axis=0,
                 use_sr=ctx.use_sr_grad,
@@ -881,14 +885,14 @@ class MXFP4GroupedGEMM(torch.autograd.Function):
             )
 
             if not is_cdna4():
-                grad_output_dq = torch.ops.torchtitan.convert_from_mxfp4(
+                grad_output_dq = ops.convert_from_mxfp4(
                     grad_output_mxfp4,
                     grad_output_scales,
                     ctx.original_dtype,
                     axis=-1,
                     is_2d_block=False,
                 )
-                grad_output_m_dq = torch.ops.torchtitan.convert_from_mxfp4(
+                grad_output_m_dq = ops.convert_from_mxfp4(
                     grad_output_mxfp4_m,
                     grad_output_scales_m,
                     ctx.original_dtype,
@@ -906,7 +910,7 @@ class MXFP4GroupedGEMM(torch.autograd.Function):
                 #grad_output_dq = grad_output_dq.contiguous()
         # Compute gradients
         if is_cdna4():
-            grad_inputs = torch.ops.torchtitan.mxfp4_grouped_gemm_backward_inputs(
+            grad_inputs = ops.mxfp4_grouped_gemm_backward_inputs(
                 grad_output=grad_output_mxfp4,
                 expert_weights=expert_weights,
                 expert_indices=expert_indices,
@@ -919,7 +923,7 @@ class MXFP4GroupedGEMM(torch.autograd.Function):
                 output_dtype=ctx.original_dtype,
             )
 
-            grad_weights = torch.ops.torchtitan.mxfp4_grouped_gemm_backward_weights(
+            grad_weights = ops.mxfp4_grouped_gemm_backward_weights(
                 grad_output=grad_output_mxfp4_m,
                 inputs=inputs,
                 expert_indices=expert_indices,
@@ -961,7 +965,7 @@ class MXFP4GroupedGEMM(torch.autograd.Function):
 
             # unpack fp4 weights
             scale_ones = expert_weights_mxfp4.new_ones(scale_shape, dtype=torch.uint8) * 127
-            w_fp4_values = torch.ops.torchtitan.convert_from_mxfp4(
+            w_fp4_values = ops.convert_from_mxfp4(
                 expert_weights_mxfp4,
                 scale_ones,
                 ctx.original_dtype,
