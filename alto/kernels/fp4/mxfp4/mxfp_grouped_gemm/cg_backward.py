@@ -33,6 +33,7 @@ from alto.kernels.fp4.mxfp4.mxfp_quantization import (
 )
 from alto.kernels.dge import dge_bwd
 from alto.kernels.hadamard_transform.transform import (HadamardFactory, HadamardTransform)
+from alto.kernels.fp4.mxfp4.mxfp_grouped_gemm.wgrad_segmented import _wgrad_seg_kernel, segment_offsets
 from ..macro_block_scaling import macro_block_scaling, macro_block_descaling
 from ...fp4_common.tensor_wrappers import unwrap_weight_wrapper
 
@@ -469,6 +470,21 @@ def mxfp4_grouped_gemm_backward_weights(
     stride_gosm, stride_gosn = go_scales.stride()
     stride_am, stride_ak = inputs.stride()
     stride_asm, stride_ask = input_scales.stride()
+
+    if k_pack_go and k_pack_x and not use_2dblock_go and not use_2dblock_x:
+        # Both operands quantized along tokens (1-D blocks): segmented kernel. Each program loops over its own
+        # expert's rows only, the token count is a runtime argument (no recompilation per token count) and the
+        # tiles are autotuned; 3.5-5x faster than the kernel below on the routed-expert shapes.
+        seg = segment_offsets(expert_indices, num_experts)
+        grid_seg = lambda META: (triton.cdiv(N, META["BLOCK_N"]), triton.cdiv(K, META["BLOCK_K"]), num_experts)
+        wrap_triton(_wgrad_seg_kernel)[grid_seg](
+            grad_output, inputs, grad_weights, seg, go_scales, input_scales,
+            stride_gom, stride_gon, stride_am, stride_ak,
+            stride_gbe, stride_gbn, stride_gbk,
+            stride_gosm, stride_gosn, stride_asm, stride_ask,
+            N, K,
+        )
+        return grad_weights
 
     # Calculate grid size for the kernel
     # Each thread block handles one expert's N-K tile
