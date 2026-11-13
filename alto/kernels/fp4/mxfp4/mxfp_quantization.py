@@ -163,6 +163,12 @@ def _pack_fp4(
     SCALE_BLOCK_M: tl.constexpr = BLOCK_M // QUANT_BLOCK_SIZE
     SCALE_BLOCK_N: tl.constexpr = BLOCK_N // QUANT_BLOCK_SIZE
     x0, x1 = tl.split(x.reshape(BLOCK_M, HALF_BLOCK_N, 2))
+    if USE_SR and USE_ASM:
+        # The gfx950 bf16 stochastic-rounding conversion (v_cvt_scalef32_sr_pk_fp4_bf16) always rounds
+        # |x| / scale < 2^-7 to zero (measured: P(round up) = 0 instead of 2|x|/scale), a bias toward zero.
+        # bf16 -> fp32 is exact, and the fp32 instruction rounds these values without bias.
+        x0 = x0.to(tl.float32)
+        x1 = x1.to(tl.float32)
 
     scales_fp32 = (scales.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
     if IS_2D_BLOCK:
@@ -383,11 +389,16 @@ def _convert_to_mxfp4_kernel(
     if USE_STATIC_CLIP:
         x *= (3.0 / 4.0)
 
+    # Stochastic rounding: give every tile its own range of Philox counters. _pack_fp4 offsets the counter
+    # only by the position inside the tile, so without this every tile of a call reused the same random
+    # numbers and rounding errors 64 rows or 64 columns apart were identical instead of independent.
+    tile_id = pid_m * tl.num_programs(axis=1) + pid_n
+    tile_philox_offset = philox_offset + tile_id * (BLOCK_M * HALF_BLOCK_N)
     y = _pack_fp4(
         x,
         scales,
         philox_seed,
-        philox_offset,
+        tile_philox_offset,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         QUANT_BLOCK_SIZE=QUANT_BLOCK_SIZE,
