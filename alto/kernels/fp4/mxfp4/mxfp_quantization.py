@@ -317,6 +317,8 @@ def _convert_to_mxfp4_kernel(
     stride_sn,
     philox_seed,
     philox_offset,
+    M,
+    N,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     QUANT_BLOCK_SIZE: tl.constexpr,
@@ -356,8 +358,18 @@ def _convert_to_mxfp4_kernel(
     offs_x = offs_m[:, None] * stride_xm + offs_xn[None, :] * stride_xn
     offs_s = offs_sm[:, None] * stride_sm + offs_sn[None, :] * stride_sn
 
+    # Bounds masks: the grid uses cdiv, so the last tile can extend past M and N. N is a multiple of
+    # QUANT_BLOCK_SIZE (checked by the wrapper), so a partial tile holds only whole quantization blocks
+    # and the zero fill never enters a real block's amax.
+    mask_m = offs_m < M
+    if IS_2D_BLOCK:
+        mask_sm = offs_sm < M // QUANT_BLOCK_SIZE
+    else:
+        mask_sm = mask_m
+    mask_s = mask_sm[:, None] & (offs_sn < N // QUANT_BLOCK_SIZE)[None, :]
+
     tl.static_assert(x_ptr.type.element_ty == tl.float32 or x_ptr.type.element_ty == tl.bfloat16)
-    x = tl.load(x_ptr + offs_x)
+    x = tl.load(x_ptr + offs_x, mask=mask_m[:, None] & (offs_xn < N)[None, :], other=0.0)
     scales = _calculate_scales(
         x,
         BLOCK_M=BLOCK_M,
@@ -385,8 +397,8 @@ def _convert_to_mxfp4_kernel(
     )
 
     offs_y = offs_m[:, None] * stride_ym + offs_yn[None, :] * stride_yn
-    tl.store(y_ptr + offs_y, y.to(y_ptr.type.element_ty))
-    tl.store(s_ptr + offs_s, scales)
+    tl.store(y_ptr + offs_y, y.to(y_ptr.type.element_ty), mask=mask_m[:, None] & (offs_yn < N // 2)[None, :])
+    tl.store(s_ptr + offs_s, scales, mask=mask_s)
 
 
 @triton.jit
@@ -400,6 +412,8 @@ def _convert_from_mxfp4_kernel(
     stride_yn,
     stride_sm,
     stride_sn,
+    M,
+    N,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     QUANT_BLOCK_SIZE: tl.constexpr,
@@ -436,8 +450,16 @@ def _convert_from_mxfp4_kernel(
     offs_x = offs_m[:, None] * stride_xm + offs_xn[None, :] * stride_xn
     offs_s = offs_sm[:, None] * stride_sm + offs_sn[None, :] * stride_sn
 
-    x = tl.load(x_ptr + offs_x)
-    s = tl.load(s_ptr + offs_s)
+    # Bounds masks (N = number of unpacked columns): the grid uses cdiv, so the last tile can extend
+    # past M and N.
+    mask_m = offs_m < M
+    if IS_2D_BLOCK:
+        mask_sm = offs_sm < M // QUANT_BLOCK_SIZE
+    else:
+        mask_sm = mask_m
+
+    x = tl.load(x_ptr + offs_x, mask=mask_m[:, None] & (offs_xn < N // 2)[None, :], other=0)
+    s = tl.load(s_ptr + offs_s, mask=mask_sm[:, None] & (offs_sn < N // QUANT_BLOCK_SIZE)[None, :], other=127)
 
     tl.static_assert(y_ptr.type.element_ty == tl.float32 or y_ptr.type.element_ty == tl.bfloat16)
 
@@ -454,7 +476,7 @@ def _convert_from_mxfp4_kernel(
     if USE_STATIC_CLIP:
         y *= (4.0 / 3.0)
     offs_y = offs_m[:, None] * stride_ym + offs_yn[None, :] * stride_yn
-    tl.store(y_ptr + offs_y, y)
+    tl.store(y_ptr + offs_y, y, mask=mask_m[:, None] & (offs_yn < N)[None, :])
 
 
 @triton_op("torchtitan::convert_to_mxfp4", mutates_args={})
@@ -501,8 +523,9 @@ def convert_to_mxfp4(
     stride_sm, stride_sn = scales.stride()
     M, N = data_hp.shape
     grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]), triton.cdiv(N, META["BLOCK_N"]))
-    BLOCK_M = 64 if M >= 64 else M
-    BLOCK_N = 64 if N >= 64 else N
+    # tile sizes must be powers of two (tl.arange); the masks handle the remainder
+    BLOCK_M = 64 if M >= 64 else triton.next_power_of_2(M)
+    BLOCK_N = 64 if N >= 64 else triton.next_power_of_2(N)
 
     if philox_seed is None:
         philox_seed = torch.randint(0, 2**31 - 1, (1,)).item()
@@ -520,6 +543,8 @@ def convert_to_mxfp4(
         stride_sn,
         philox_seed,
         philox_offset,
+        M,
+        N,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         QUANT_BLOCK_SIZE=block_size,
@@ -573,8 +598,9 @@ def convert_from_mxfp4(
     stride_sm, stride_sn = scales.stride()
     M, N = data_hp.shape
     grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]), triton.cdiv(N, META["BLOCK_N"]))
-    BLOCK_M = 64 if M >= 64 else M
-    BLOCK_N = 64 if N >= 64 else N
+    # tile sizes must be powers of two (tl.arange); the masks handle the remainder
+    BLOCK_M = 64 if M >= 64 else triton.next_power_of_2(M)
+    BLOCK_N = 64 if N >= 64 else triton.next_power_of_2(N)
     wrap_triton(_convert_from_mxfp4_kernel)[grid](
         data_lp,
         data_hp,
@@ -585,6 +611,8 @@ def convert_from_mxfp4(
         stride_yn,
         stride_sm,
         stride_sn,
+        M,
+        N,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         QUANT_BLOCK_SIZE=block_size,

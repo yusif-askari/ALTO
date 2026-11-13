@@ -291,13 +291,17 @@ def _kernel_mxfp4_grouped_gemm_backward_dw(
     pid = tl.program_id(0)
 
     # Determine expert and position within the matrix
-    expert_id = pid // ((N * K) // (BLOCK_SIZE_N * BLOCK_SIZE_K))
-    position_id = pid % ((N * K) // (BLOCK_SIZE_N * BLOCK_SIZE_K))
+    # Tile counts must match the launch grid, which uses cdiv: with floor division the last K (or N)
+    # tile of every expert was never computed when K (or N) is not a multiple of the block size.
+    n_k_tiles = (K + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
+    tiles_per_expert = ((N + BLOCK_SIZE_N - 1) // BLOCK_SIZE_N) * n_k_tiles
+    expert_id = pid // tiles_per_expert
+    position_id = pid % tiles_per_expert
 
     # Only process if expert is valid
     if expert_id < NUM_EXPERTS:
         # Calculate positions in N and K dimensions
-        n_tiles = K // BLOCK_SIZE_K
+        n_tiles = n_k_tiles
         tile_n = position_id // n_tiles
         tile_k = position_id % n_tiles
 
