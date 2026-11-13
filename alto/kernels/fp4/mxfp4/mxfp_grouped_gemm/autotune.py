@@ -11,7 +11,11 @@ import triton
 import triton.language as tl
 
 ALIGN_SIZE_M = 128
-AUTOTUNE = False
+import os
+
+# ALTO shipped with AUTOTUNE = False (one fixed 128x128x128 config). On by default here; set
+# ALTO_MXFP4_GROUPED_AUTOTUNE=0 for the old behaviour.
+AUTOTUNE = os.environ.get("ALTO_MXFP4_GROUPED_AUTOTUNE", "1") == "1"
 
 if AUTOTUNE:
     STANDARD_CONFIGS = [

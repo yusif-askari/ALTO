@@ -29,6 +29,17 @@ from .mxfp_quantization import (
 from .macro_block_scaling import macro_block_scaling, macro_block_descaling
 
 
+def _gemm_configs():
+    # (BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, num_warps); ALTO used a fixed 64x64x64 tile
+    shapes = [(64, 64, 64, 4), (128, 128, 64, 4), (128, 128, 128, 4), (128, 128, 256, 4), (256, 128, 128, 8),
+              (128, 256, 128, 8), (256, 256, 128, 8), (256, 128, 256, 8), (128, 256, 256, 8), (64, 128, 256, 4),
+              (128, 64, 256, 4), (256, 256, 64, 8)]
+    return [triton.Config({"BLOCK_SIZE_M": m, "BLOCK_SIZE_N": n, "BLOCK_SIZE_K": k}, num_warps=w, num_stages=2)
+            for m, n, k, w in shapes]
+
+
+@triton.autotune(configs=_gemm_configs(),
+                 key=["M", "N", "K", "USE_2DBLOCK_A", "USE_2DBLOCK_B", "K_PACK_A", "K_PACK_B"])
 @triton.jit
 def blockwise_mxfp4_gemm_kernel(
     a_ptr,
@@ -222,9 +233,7 @@ def blockwise_mxfp4_gemm(
         triton.cdiv(M, META["BLOCK_SIZE_M"]),
         triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
-    BLOCK_SIZE_M = 64 if M >= 64 else M
-    BLOCK_SIZE_N = 64 if N >= 64 else N
-    BLOCK_SIZE_K = 64 if K >= 64 else K
+    # tile sizes are autotuned (configs above); the loads are masked, so any M, N, K (K % 32 == 0) works
     wrap_triton(blockwise_mxfp4_gemm_kernel)[grid](
         a,
         b,
@@ -244,9 +253,6 @@ def blockwise_mxfp4_gemm(
         M,
         N,
         K,
-        BLOCK_SIZE_M=BLOCK_SIZE_M,
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        BLOCK_SIZE_K=BLOCK_SIZE_K,
         QUANT_BLOCK_SIZE=block_size,
         USE_2DBLOCK_A=use_2dblock_a,
         USE_2DBLOCK_B=use_2dblock_b,

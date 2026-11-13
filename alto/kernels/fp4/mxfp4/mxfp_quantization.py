@@ -310,7 +310,20 @@ def _unpack_fp4(
     return y
 
 
-@triton.jit
+def _quant_configs():
+    # (BLOCK_M, BLOCK_N, num_warps); ALTO used a fixed 64x64 tile. BLOCK_N runs along the quantized axis.
+    shapes = [(64, 64, 4), (32, 128, 4), (64, 128, 4), (128, 64, 4), (128, 128, 8), (32, 256, 4), (64, 256, 8),
+              (128, 32, 4)]
+    return [triton.Config({"BLOCK_M": m, "BLOCK_N": n}, num_warps=w, num_stages=1) for m, n, w in shapes]
+
+
+# Tuned per power-of-two bucket of the sizes, so a varying token count does not re-tune every call. The random
+# Philox seed/offset are not specialized on (Triton would otherwise compile one variant per divisibility-by-16
+# pattern of these random integers, 0.1-0.3 s each, at random times during the first calls).
+@triton.autotune(configs=_quant_configs(),
+                 key=["M_BUCKET", "N_BUCKET", "IS_2D_BLOCK", "USE_SR", "USE_ASM", "USE_STATIC_CLIP",
+                      "USE_DYNAMIC_CLIP", "SCALE_SELECTION"])
+@triton.jit(do_not_specialize=["philox_seed", "philox_offset"])
 def _convert_to_mxfp4_kernel(
     x_ptr,
     y_ptr,
@@ -325,6 +338,8 @@ def _convert_to_mxfp4_kernel(
     philox_offset,
     M,
     N,
+    M_BUCKET,
+    N_BUCKET,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     QUANT_BLOCK_SIZE: tl.constexpr,
@@ -528,15 +543,13 @@ def convert_to_mxfp4(
         scales_shape = (*ori_shape[:-2], ori_shape[-2] // block_size, ori_shape[-1] // block_size)
     else:
         scales_shape = (*ori_shape[:-1], ori_shape[-1] // block_size)
-    scales = torch.ones(scales_shape, dtype=torch.uint8, device=data_hp.device).reshape(-1, scales_shape[-1])
+    # every scale is written by the (masked) kernel, so no fill is needed (ALTO used torch.ones)
+    scales = torch.empty(scales_shape, dtype=torch.uint8, device=data_hp.device).reshape(-1, scales_shape[-1])
     stride_xm, stride_xn = data_hp.stride()
     stride_ym, stride_yn = data_lp.stride()
     stride_sm, stride_sn = scales.stride()
     M, N = data_hp.shape
     grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]), triton.cdiv(N, META["BLOCK_N"]))
-    # tile sizes must be powers of two (tl.arange); the masks handle the remainder
-    BLOCK_M = 64 if M >= 64 else triton.next_power_of_2(M)
-    BLOCK_N = 64 if N >= 64 else triton.next_power_of_2(N)
 
     if philox_seed is None:
         philox_seed = torch.randint(0, 2**31 - 1, (1,)).item()
@@ -556,8 +569,8 @@ def convert_to_mxfp4(
         philox_offset,
         M,
         N,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
+        triton.next_power_of_2(M),
+        triton.next_power_of_2(N),
         QUANT_BLOCK_SIZE=block_size,
         IS_2D_BLOCK=is_2d_block,
         USE_SR=use_sr,
