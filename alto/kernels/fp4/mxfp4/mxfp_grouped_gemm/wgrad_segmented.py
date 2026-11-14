@@ -34,16 +34,20 @@ def _configs():
     return cfgs
 
 
-@triton.autotune(configs=_configs(), key=["N", "K"])
 @triton.jit
-def _wgrad_seg_kernel(
+def _wgrad_seg_body(
     go_ptr, x_ptr, dw_ptr, seg_ptr, gos_ptr, xs_ptr,
     stride_gom, stride_gon, stride_xm, stride_xk,
     stride_we, stride_wn, stride_wk,
     stride_gosm, stride_gosn, stride_xsm, stride_xsk,
-    N, K,
+    N, K, mg_ptrs_ptr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    ACCUM: tl.constexpr, MG_FP32: tl.constexpr,
 ):
+    """ACCUM: instead of storing dW[e], add the fp32 accumulator into the tensor at address mg_ptrs[e]
+    (Megatron's main_grad of expert e, [N, K] with strides stride_wn, stride_wk; fp32 if MG_FP32 else bf16):
+    the gradient-accumulation fusion of TE's GroupedLinear. Every (e, N tile, K tile) is owned by one
+    program, so the read-modify-write is race-free and deterministic."""
     pid_n = tl.program_id(0)
     pid_k = tl.program_id(1)
     e = tl.program_id(2)
@@ -73,8 +77,88 @@ def _wgrad_seg_kernel(
         # separate add (not dot_scaled(..., acc)): same rounding order as ALTO's kernel, which reproduces
         # the emulation bit for bit; accumulating inside the MFMA changed 2 of 5.8e7 outputs by 1 bf16 ulp
         acc += tl.dot_scaled(go, gs, "e2m1", xx, xs, "e2m1")
-    w_ptrs = dw_ptr + e * stride_we + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk
-    tl.store(w_ptrs, acc.to(dw_ptr.dtype.element_ty), mask=mask_n[:, None] & mask_k[None, :])
+    mask_nk = mask_n[:, None] & mask_k[None, :]
+    if ACCUM:
+        if MG_FP32:
+            mg = tl.load(mg_ptrs_ptr + e).to(tl.pointer_type(tl.float32))
+        else:
+            mg = tl.load(mg_ptrs_ptr + e).to(tl.pointer_type(tl.bfloat16))
+        m_ptrs = mg + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk
+        old = tl.load(m_ptrs, mask=mask_nk, other=0.0).to(tl.float32)
+        tl.store(m_ptrs, (old + acc).to(mg.dtype.element_ty), mask=mask_nk)
+    else:
+        w_ptrs = dw_ptr + e * stride_we + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk
+        tl.store(w_ptrs, acc.to(dw_ptr.dtype.element_ty), mask=mask_nk)
+
+
+@triton.autotune(configs=_configs(), key=["N", "K"])
+@triton.jit
+def _wgrad_seg_kernel(
+    go_ptr, x_ptr, dw_ptr, seg_ptr, gos_ptr, xs_ptr,
+    stride_gom, stride_gon, stride_xm, stride_xk,
+    stride_we, stride_wn, stride_wk,
+    stride_gosm, stride_gosn, stride_xsm, stride_xsk,
+    N, K,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    _wgrad_seg_body(go_ptr, x_ptr, dw_ptr, seg_ptr, gos_ptr, xs_ptr,
+                    stride_gom, stride_gon, stride_xm, stride_xk, stride_we, stride_wn, stride_wk,
+                    stride_gosm, stride_gosn, stride_xsm, stride_xsk, N, K, seg_ptr,
+                    BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, ACCUM=False, MG_FP32=True)
+
+
+@triton.jit
+def _wgrad_seg_accum_kernel(
+    go_ptr, x_ptr, seg_ptr, gos_ptr, xs_ptr, mg_ptrs_ptr,
+    stride_gom, stride_gon, stride_xm, stride_xk, stride_wn, stride_wk,
+    stride_gosm, stride_gosn, stride_xsm, stride_xsk,
+    N, K,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, MG_FP32: tl.constexpr,
+):
+    """In-place variant (not autotuned: the autotuner would apply the update once per trial)."""
+    _wgrad_seg_body(go_ptr, x_ptr, go_ptr, seg_ptr, gos_ptr, xs_ptr,
+                    stride_gom, stride_gon, stride_xm, stride_xk, 0, stride_wn, stride_wk,
+                    stride_gosm, stride_gosn, stride_xsm, stride_xsk, N, K, mg_ptrs_ptr,
+                    BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, ACCUM=True, MG_FP32=MG_FP32)
+
+
+_ACCUM_CFG = {}
+
+
+def wgrad_accumulate(grad_output, inputs, expert_indices, go_scales, input_scales, main_grad_ptrs,
+                     main_grad_like):
+    """main_grad[e] += dyᵀ_e · x_e for every expert e, in fp32, with the operands of
+    mxfp4_grouped_gemm_backward_weights (k_pack_go = k_pack_x = True, 1-D scales, trans_weights): the
+    gradient-accumulation fusion of TE's GroupedLinear for ALTO's grouped wgrad, no bf16 dW in between.
+
+    main_grad_ptrs [E] int64: data_ptr of every expert's main_grad (all of the shape, dtype and strides of
+    main_grad_like [N, K], fp32 or bf16). Tile sizes: the autotuned config of the out-of-place kernel for
+    the same (N, K), tuned once here on a scratch output if needed."""
+    num_experts = main_grad_ptrs.shape[0]
+    TP2, N = grad_output.shape
+    _, K = inputs.shape
+    assert main_grad_like.shape == (N, K) and main_grad_like.dtype in (torch.float32, torch.bfloat16)
+    assert main_grad_ptrs.dtype == torch.int64 and main_grad_ptrs.is_contiguous()
+    seg = segment_offsets(expert_indices, num_experts)
+    key = (N, K)
+    if key not in _ACCUM_CFG:
+        scratch = torch.empty((num_experts, N, K), device=grad_output.device, dtype=torch.bfloat16)
+        grid = lambda META: (triton.cdiv(N, META["BLOCK_N"]), triton.cdiv(K, META["BLOCK_K"]), num_experts)
+        _wgrad_seg_kernel[grid](
+            grad_output, inputs, scratch, seg, go_scales, input_scales,
+            grad_output.stride(0), grad_output.stride(1), inputs.stride(0), inputs.stride(1),
+            *scratch.stride(), go_scales.stride(0), go_scales.stride(1), input_scales.stride(0),
+            input_scales.stride(1), N, K)
+        _ACCUM_CFG[key] = _wgrad_seg_kernel.best_config
+    cfg = _ACCUM_CFG[key]
+    grid = (triton.cdiv(N, cfg.kwargs["BLOCK_N"]), triton.cdiv(K, cfg.kwargs["BLOCK_K"]), num_experts)
+    _wgrad_seg_accum_kernel[grid](
+        grad_output, inputs, seg, go_scales, input_scales, main_grad_ptrs,
+        grad_output.stride(0), grad_output.stride(1), inputs.stride(0), inputs.stride(1),
+        main_grad_like.stride(0), main_grad_like.stride(1),
+        go_scales.stride(0), go_scales.stride(1), input_scales.stride(0), input_scales.stride(1),
+        N, K, MG_FP32=main_grad_like.dtype == torch.float32,
+        num_warps=cfg.num_warps, num_stages=cfg.num_stages, **cfg.kwargs)
 
 
 def segment_offsets(expert_indices: torch.Tensor, num_experts: int) -> torch.Tensor:

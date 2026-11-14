@@ -33,7 +33,7 @@ def _configs():
             for m, n, k, w in shapes]
 
 
-@triton.autotune(configs=_configs(), key=["F", "K", "TP_BUCKET", "STORE_H", "ROW_MAP"])
+@triton.autotune(configs=_configs(), key=["F", "K", "TP_BUCKET", "STORE_H", "ROW_MAP", "STORE_Y"])
 @triton.jit
 def _fc1_swiglu_quant_kernel(
     xq_ptr, xs_ptr, w_ptr, ws_ptr, idx_ptr, p_ptr, rows_ptr, had_ptr,
@@ -43,6 +43,7 @@ def _fc1_swiglu_quant_kernel(
     F: tl.constexpr, K: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
     SCALE_SELECTION: tl.constexpr, STORE_H: tl.constexpr, ROW_MAP: tl.constexpr,
+    STORE_Y: tl.constexpr = True,
 ):
     QB: tl.constexpr = 32
     KP: tl.constexpr = K // 2              # packed K
@@ -90,8 +91,9 @@ def _fc1_swiglu_quant_kernel(
     g = acc_g.to(tl.bfloat16)
     v = acc_v.to(tl.bfloat16)
     mask_mn = mask_m[:, None] & mask_n[None, :]
-    tl.store(y_ptr + offs_m[:, None] * (2 * F) + offs_n[None, :], g, mask=mask_mn)
-    tl.store(y_ptr + offs_m[:, None] * (2 * F) + (F + offs_n)[None, :], v, mask=mask_mn)
+    if STORE_Y:      # False: profiling only (cost of keeping y for the backward)
+        tl.store(y_ptr + offs_m[:, None] * (2 * F) + offs_n[None, :], g, mask=mask_mn)
+        tl.store(y_ptr + offs_m[:, None] * (2 * F) + (F + offs_n)[None, :], v, mask=mask_mn)
 
     # ---- h = bf16(silu(g) * v * p), fp32 arithmetic from the bf16 g, v (one rounding at the end).
     # silu(g) = g / (1 + exp(-g)) with libdevice exp, exactly as torch.compile (inductor) generates it for
@@ -140,7 +142,7 @@ def _fc1_swiglu_quant_kernel(
 
 
 def fc1_swiglu_quant(xq, xs, wq, ws, expert_indices, probs, hadamard, blockscale_selection="default",
-                     store_h=False, src_rows=None):
+                     store_h=False, src_rows=None, store_y=True):
     """Fused routed fc1 + SwiGLU + fc2 input quantization.
 
     xq [Tp, K/2] uint8, xs [Tp, K/32] uint8: Q(x) along K (Tp = padded rows, segments 128-aligned)
@@ -173,7 +175,7 @@ def fc1_swiglu_quant(xq, xs, wq, ws, expert_indices, probs, hadamard, blockscale
         y, qa, sa, qb, sb, hout,
         wq.stride(0), wq.stride(1), ws.stride(0), ws.stride(1),
         Tp, triton.next_power_of_2(Tp),
-        F=F, K=K, SCALE_SELECTION=blockscale_selection, STORE_H=store_h, ROW_MAP=src_rows is not None,
+        F=F, K=K, SCALE_SELECTION=blockscale_selection, STORE_H=store_h, ROW_MAP=src_rows is not None, STORE_Y=store_y,
     )
     out = (y, qa, sa, qb.t(), sb.t())
     return out + ((hout,) if store_h else ())

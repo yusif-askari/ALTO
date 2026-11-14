@@ -81,6 +81,7 @@ def blockwise_mxfp4_gemm_kernel(
     USE_2DBLOCK_B: tl.constexpr,
     K_PACK_A: tl.constexpr,
     K_PACK_B: tl.constexpr,
+    ACCUM: tl.constexpr = False,
 ):
     if USE_2DBLOCK_A:
         tl.assume(BLOCK_SIZE_M % QUANT_BLOCK_SIZE == 0)
@@ -159,8 +160,11 @@ def blockwise_mxfp4_gemm_kernel(
                                      rhs_k_pack=K_PACK_B,
                                      out_dtype=tl.float32)
 
-    c = accumulator.to(c_ptr.dtype.element_ty)
     c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    if ACCUM:   # c += A·B in fp32 (gradient-accumulation fusion into main_grad)
+        old = tl.load(c_ptrs, mask=mask_m[:, None] & mask_n[None, :], other=0.0).to(tl.float32)
+        accumulator = old + accumulator
+    c = accumulator.to(c_ptr.dtype.element_ty)
     tl.store(c_ptrs, c, mask=mask_m[:, None] & mask_n[None, :])
 
 
@@ -275,6 +279,39 @@ def blockwise_mxfp4_gemm(
     return c
 
 
+# Off by default; Megatron's MXFP4 backend switches it on: the wgrad of MXFP4LinearFunction is added into
+# weight.main_grad (fp32) inside the GEMM when the weight has Megatron's main_grad / grad_added_to_main_grad.
+WGRAD_INTO_MAIN_GRAD = False
+_ACCUM_CFG = {}
+
+
+def blockwise_mxfp4_gemm_accumulate_(a, a_s, b, b_s, out):
+    """out [M, N] += aᵀ · b in fp32 (fp32 or bf16 out), for the wgrad operands: a [K/2, M], b [K/2, N] packed
+    along the contraction axis K (tokens), 1-D scales a_s [K/32, M], b_s [K/32, N]. Same kernel and tiles as
+    blockwise_mxfp4_gemm(a, a_s, b, b_s, trans_a=True); the in-place launch is not autotuned (each trial
+    would add once more): it uses the config tuned for the same shapes, tuned here once if needed."""
+    K2, M = a.shape
+    K2b, N = b.shape
+    K = 2 * K2
+    assert K2b == K2 and out.shape == (M, N) and out.dtype in (torch.float32, torch.bfloat16)
+    assert a_s.shape == (K // BLOCK_SIZE_DEFAULT, M) and b_s.shape == (K // BLOCK_SIZE_DEFAULT, N)
+    key = (M, N, K)
+    if key not in _ACCUM_CFG:
+        blockwise_mxfp4_gemm(a, a_s, b, b_s, trans_a=True, output_dtype=out.dtype)
+        _ACCUM_CFG[key] = blockwise_mxfp4_gemm_kernel.best_config
+    cfg = _ACCUM_CFG[key]
+    stride_ak, stride_am = a.stride()
+    stride_ask, stride_asm = a_s.stride()
+    stride_bk, stride_bn = b.stride()
+    stride_bsk, stride_bsn = b_s.stride()
+    grid = (triton.cdiv(M, cfg.kwargs["BLOCK_SIZE_M"]), triton.cdiv(N, cfg.kwargs["BLOCK_SIZE_N"]))
+    blockwise_mxfp4_gemm_kernel.fn[grid](
+        a, b, out, a_s, b_s, stride_am, stride_ak, stride_bn, stride_bk, out.stride(0), out.stride(1),
+        stride_asm, stride_ask, stride_bsn, stride_bsk, M, N, K,
+        QUANT_BLOCK_SIZE=BLOCK_SIZE_DEFAULT, USE_2DBLOCK_A=False, USE_2DBLOCK_B=False, K_PACK_A=True,
+        K_PACK_B=True, ACCUM=True, num_warps=cfg.num_warps, num_stages=cfg.num_stages, **cfg.kwargs)
+
+
 @torch.compiler.allow_in_graph
 class MXFP4LinearFunction(torch.autograd.Function):
     """
@@ -313,6 +350,7 @@ class MXFP4LinearFunction(torch.autograd.Function):
         # tensor before saving / quantizing it.  As with NVFP4, DTensor inputs
         # are normally already unwrapped to local tensors before this function
         # is entered.
+        param = weight
         weight = unwrap_weight_wrapper(weight)
 
         original_shape = x.shape
@@ -461,6 +499,10 @@ class MXFP4LinearFunction(torch.autograd.Function):
         ctx.hadamard_transform = hadamard_transform
         ctx.use_dge = use_dge
         ctx.clip_mode = clip_mode
+        # gradient-accumulation fusion (as TE's linears): the wgrad GEMM adds into weight.main_grad in fp32
+        ctx.main_grad_param = (param if WGRAD_INTO_MAIN_GRAD and hasattr(param, "main_grad")
+                               and getattr(param, "grad_added_to_main_grad", None) is not None
+                               and clip_mode != "static" and not use_dge and not use_2dblock_x else None)
         ctx.blockscale_selection = blockscale_selection
         ctx.use_macro_block_scaling = use_macro_block_scaling
         ctx.module_id = module_id
@@ -593,18 +635,27 @@ class MXFP4LinearFunction(torch.autograd.Function):
                 k_pack_b=not ctx.use_2dblock_w,
                 output_dtype=ctx.original_dtype,
             )
-            grad_weights = ops.blockwise_mxfp4_gemm(
-                grad_output_mxfp4_m,
-                grad_output_scales_m,
-                inputs_mxfp4,
-                input_scales,
-                use_2dblock_a=ctx.use_2dblock_x,
-                use_2dblock_b=ctx.use_2dblock_x,
-                trans_a=True,
-                k_pack_a=not ctx.use_2dblock_x,
-                k_pack_b=not ctx.use_2dblock_x,
-                output_dtype=ctx.original_dtype,
-            )
+            mg_param = getattr(ctx, "main_grad_param", None)
+            if mg_param is not None:
+                blockwise_mxfp4_gemm_accumulate_(grad_output_mxfp4_m, grad_output_scales_m, inputs_mxfp4,
+                                                 input_scales, mg_param.main_grad)
+                mg_param.grad_added_to_main_grad = True
+                # placeholder grad for the DDP hook (skipped because grad_added_to_main_grad); a fresh
+                # tensor, so autograd's AccumulateGrad takes it without a copy
+                grad_weights = torch.empty_like(mg_param)
+            else:
+                grad_weights = ops.blockwise_mxfp4_gemm(
+                    grad_output_mxfp4_m,
+                    grad_output_scales_m,
+                    inputs_mxfp4,
+                    input_scales,
+                    use_2dblock_a=ctx.use_2dblock_x,
+                    use_2dblock_b=ctx.use_2dblock_x,
+                    trans_a=True,
+                    k_pack_a=not ctx.use_2dblock_x,
+                    k_pack_b=not ctx.use_2dblock_x,
+                    output_dtype=ctx.original_dtype,
+                )
             if ctx.clip_mode == "static":
                 grad_weights *= (16.0 / 9.0)
         else:
