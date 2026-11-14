@@ -28,6 +28,17 @@ from .mxfp_quantization import (
 )
 from .macro_block_scaling import macro_block_scaling, macro_block_descaling
 from alto.kernels.fp4.mxfp4._eager_ops import ops
+from alto.kernels.fp4.mxfp4.mxfp_dual_quant import dual_quantize, dual_quantize_supported
+import os as _os
+
+# Fused quantization (one pass over x / dy for both operands, Hadamard inside the kernel); set
+# ALTO_MXFP4_FUSED_HADAMARD=0 for ALTO's separate passes.
+_FUSED_HADAMARD = _os.environ.get("ALTO_MXFP4_FUSED_HADAMARD", "1") == "1"
+
+
+def _fused_ok(t, hadamard_transform, use_2dblock_x, use_2dblock_w, use_macro_block_scaling, clip_mode):
+    return (_FUSED_HADAMARD and hadamard_transform is not None and not use_2dblock_x and use_2dblock_w
+            and not use_macro_block_scaling and clip_mode == "none" and dual_quantize_supported(t))
 
 
 def _gemm_configs():
@@ -324,12 +335,17 @@ class MXFP4LinearFunction(torch.autograd.Function):
             w_scaled = w_fwd
             w_mbs = w_fwd.new_empty([])
 
-        x_mxfp4, x_scale = ops.convert_to_mxfp4(
-            x_scaled,
-            axis=-1,
-            is_2d_block=use_2dblock_x,
-            blockscale_selection=blockscale_selection,
-        )
+        fused = _fused_ok(x, hadamard_transform, use_2dblock_x, use_2dblock_w, use_macro_block_scaling, clip_mode)
+        if fused:
+            x_mxfp4, x_scale, x_t_mxfp4, x_t_scale = dual_quantize(
+                x_scaled, hadamard_transform.weight, use_sr=False, blockscale_selection=blockscale_selection)
+        else:
+            x_mxfp4, x_scale = ops.convert_to_mxfp4(
+                x_scaled,
+                axis=-1,
+                is_2d_block=use_2dblock_x,
+                blockscale_selection=blockscale_selection,
+            )
 
         w_mxfp4, w_scale = ops.convert_to_mxfp4(
             w_scaled,
@@ -398,7 +414,9 @@ class MXFP4LinearFunction(torch.autograd.Function):
                 if use_macro_block_scaling:
                     w_dq = macro_block_descaling(w_dq, w_mbs, axis=0, use_2d_block=False)
 
-        if not use_2dblock_x:
+        if not use_2dblock_x and fused:
+            x_mxfp4, x_scale = x_t_mxfp4, x_t_scale
+        elif not use_2dblock_x:
             if hadamard_transform is not None:
                 x = hadamard_transform(x, left_mul=True)
             if use_macro_block_scaling:
@@ -438,6 +456,7 @@ class MXFP4LinearFunction(torch.autograd.Function):
         ctx.blockscale_selection = blockscale_selection
         ctx.use_macro_block_scaling = use_macro_block_scaling
         ctx.module_id = module_id
+        ctx.fused = fused
 
         return y.view(*original_shape[:-1], -1)  # Reshape back to original
 
@@ -491,6 +510,10 @@ class MXFP4LinearFunction(torch.autograd.Function):
                 if ctx.use_macro_block_scaling:
                     grad_output_dq = macro_block_descaling(grad_output_dq, grad_output_mbs, axis=-1, use_2d_block=True)
                 grad_output_m_dq = grad_output_dq
+        elif ctx.fused and is_cdna4() and dual_quantize_supported(grad_output):
+            grad_output_mxfp4, grad_output_scales, grad_output_mxfp4_m, grad_output_scales_m = dual_quantize(
+                grad_output, ctx.hadamard_transform.weight, use_sr=bool(ctx.use_sr_grad),
+                blockscale_selection=ctx.blockscale_selection)
         else:
             # dgrad grad_output rotation: Q(GH^T) for dgrad path (1D quant only)
             if ctx.hadamard_transform is not None and not ctx.use_2dblock_w:

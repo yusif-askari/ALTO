@@ -34,6 +34,8 @@ from alto.kernels.fp4.mxfp4.mxfp_quantization import (
 from alto.kernels.dge import dge_bwd
 from alto.kernels.hadamard_transform.transform import (HadamardFactory, HadamardTransform)
 from alto.kernels.fp4.mxfp4._eager_ops import ops
+from alto.kernels.fp4.mxfp4.mxfp_linear import _fused_ok
+from alto.kernels.fp4.mxfp4.mxfp_dual_quant import dual_quantize, dual_quantize_supported
 from alto.kernels.fp4.mxfp4.mxfp_grouped_gemm.wgrad_segmented import _wgrad_seg_kernel, segment_offsets
 from ..macro_block_scaling import macro_block_scaling, macro_block_descaling
 from ...fp4_common.tensor_wrappers import unwrap_weight_wrapper
@@ -677,12 +679,19 @@ class MXFP4GroupedGEMM(torch.autograd.Function):
             input_mbs = inputs_fwd.new_empty([])
             expert_weights_scaled = expert_weights_fwd
             expert_weight_mbs = expert_weights_fwd.new_empty([])
-        inputs_mxfp4, input_scales = ops.convert_to_mxfp4(
-            inputs_scaled,
-            axis=-1,
-            is_2d_block=use_2dblock_x,
-            blockscale_selection=blockscale_selection,
-        )
+        fused = _fused_ok(inputs, hadamard_transform, use_2dblock_x, use_2dblock_w, use_macro_block_scaling,
+                          clip_mode)
+        if fused:
+            # inputs along K for the forward GEMM and H·inputs along tokens for the wgrad, one pass
+            inputs_mxfp4, input_scales, inputs_t_mxfp4, inputs_t_scales = dual_quantize(
+                inputs_scaled, hadamard_transform.weight, use_sr=False, blockscale_selection=blockscale_selection)
+        else:
+            inputs_mxfp4, input_scales = ops.convert_to_mxfp4(
+                inputs_scaled,
+                axis=-1,
+                is_2d_block=use_2dblock_x,
+                blockscale_selection=blockscale_selection,
+            )
         expert_weights_mxfp4, expert_weight_scales = ops.convert_to_mxfp4(
             expert_weights_scaled,
             axis=quant_axis_w,
@@ -756,7 +765,9 @@ class MXFP4GroupedGEMM(torch.autograd.Function):
                 if not trans_weights:
                     w_dq = w_dq.transpose(-2, -1)
                 #w_dq = w_dq.contiguous()
-        if not use_2dblock_x:
+        if not use_2dblock_x and fused:
+            inputs_mxfp4, input_scales = inputs_t_mxfp4, inputs_t_scales
+        elif not use_2dblock_x:
             if hadamard_transform is not None:
                 inputs = hadamard_transform(inputs, left_mul=True)
             if use_macro_block_scaling:
@@ -798,6 +809,7 @@ class MXFP4GroupedGEMM(torch.autograd.Function):
         ctx.hadamard_transform = hadamard_transform
         ctx.clip_mode = clip_mode
         ctx.blockscale_selection = blockscale_selection
+        ctx.fused = fused
         ctx.use_macro_block_scaling = use_macro_block_scaling
 
         return res
@@ -849,6 +861,10 @@ class MXFP4GroupedGEMM(torch.autograd.Function):
                     grad_output_dq = macro_block_descaling(grad_output_dq, grad_output_mbs, axis=-1, use_2d_block=True)
                 #grad_output_dq = grad_output_dq.contiguous()
                 grad_output_m_dq = grad_output_dq
+        elif ctx.fused and is_cdna4() and dual_quantize_supported(grad_output):
+            grad_output_mxfp4, grad_output_scales, grad_output_mxfp4_m, grad_output_scales_m = dual_quantize(
+                grad_output, ctx.hadamard_transform.weight, use_sr=bool(ctx.use_sr_grad),
+                blockscale_selection=ctx.blockscale_selection)
         else:
             # dgrad grad_output rotation: Q(GH^T) for dgrad path (1D quant only)
             if ctx.hadamard_transform is not None and not ctx.use_2dblock_w:
