@@ -37,7 +37,15 @@ from alto.kernels.fp4.mxfp4._eager_ops import ops
 from alto.kernels.fp4.mxfp4.mxfp_linear import _fused_ok
 from alto.kernels.fp4.mxfp4.mxfp_dual_quant import dual_quantize, dual_quantize_supported
 from alto.kernels.fp4.mxfp4 import mxfp_weight_cache
-from alto.kernels.fp4.mxfp4.mxfp_grouped_gemm.wgrad_segmented import _wgrad_seg_kernel, segment_offsets
+from alto.kernels.fp4.mxfp4.mxfp_grouped_gemm.wgrad_segmented import (_wgrad_seg_kernel, segment_offsets,
+                                                                       _wgrad_bal_kernel, _wgrad_reduce_kernel,
+                                                                       balanced_chunk)
+import os as _os
+
+# Split long expert segments in the wgrad (load balancing for skewed routing). Off by default: measured on
+# MI350X it saves ~0.05 ms per routed GEMM when the largest expert holds ~10x the mean rows, but costs ~0.04-0.06
+# ms when routing is balanced (in-kernel work-list bookkeeping + reduction launch). ALTO_MXFP4_WGRAD_SPLIT=1 on.
+_WGRAD_SPLIT = _os.environ.get("ALTO_MXFP4_WGRAD_SPLIT", "0") == "1"
 from ..macro_block_scaling import macro_block_scaling, macro_block_descaling
 from ...fp4_common.tensor_wrappers import unwrap_weight_wrapper
 
@@ -483,6 +491,27 @@ def mxfp4_grouped_gemm_backward_weights(
         # expert's rows only, the token count is a runtime argument (no recompilation per token count) and the
         # tiles are autotuned; 3.5-5x faster than the kernel below on the routed-expert shapes.
         seg = segment_offsets(expert_indices, num_experts)
+        if _WGRAD_SPLIT:
+            chunk = balanced_chunk(M_total, num_experts)
+            # upper bound on work items: one per expert plus at most rows / chunk extra chunks
+            max_items = num_experts + M_total // chunk + 1
+            # fp32 partial tiles of split experts: at most 2 * rows / chunk chunks in total
+            part = torch.empty((2 * (M_total // chunk) + 2, N, K), device=grad_output.device, dtype=torch.float32)
+            e_pow2 = triton.next_power_of_2(num_experts)
+            grid_bal = lambda META: (triton.cdiv(N, META["BLOCK_N"]), triton.cdiv(K, META["BLOCK_K"]), max_items)
+            wrap_triton(_wgrad_bal_kernel)[grid_bal](
+                grad_output, inputs, grad_weights, part, seg, go_scales, input_scales,
+                stride_gom, stride_gon, stride_am, stride_ak,
+                stride_gbe, stride_gbn, stride_gbk,
+                stride_gosm, stride_gosn, stride_asm, stride_ask,
+                N, K, chunk, num_experts, E_POW2=e_pow2,
+            )
+            grid_red = (triton.cdiv(N, 64), triton.cdiv(K, 64), num_experts)
+            wrap_triton(_wgrad_reduce_kernel)[grid_red](
+                grad_weights, part, seg, stride_gbe, stride_gbn, stride_gbk, N, K, chunk, num_experts,
+                E_POW2=e_pow2, BLOCK_N=64, BLOCK_K=64,
+            )
+            return grad_weights
         grid_seg = lambda META: (triton.cdiv(N, META["BLOCK_N"]), triton.cdiv(K, META["BLOCK_K"]), num_experts)
         wrap_triton(_wgrad_seg_kernel)[grid_seg](
             grad_output, inputs, grad_weights, seg, go_scales, input_scales,
