@@ -20,6 +20,8 @@ import torch
 import triton
 import triton.language as tl
 
+from alto.kernels.fp4.mxfp4.mxfp_quantization import SR_BF16
+
 from .mxfp_quantization import _calculate_scales, _pack_fp4, is_cdna4
 
 
@@ -31,13 +33,21 @@ def _pack_fp4_sr(x, scales, rand, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, 
     HALF_BLOCK_N: tl.constexpr = BLOCK_N // 2
     SCALE_BLOCK_N: tl.constexpr = BLOCK_N // QUANT_BLOCK_SIZE
     HALF_Q: tl.constexpr = QUANT_BLOCK_SIZE // 2
-    x0, x1 = tl.split(x.to(tl.float32).reshape(BLOCK_M, HALF_BLOCK_N, 2))
     sf = (scales.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
     sf = sf.expand_dims(axis=2).broadcast_to(BLOCK_M, SCALE_BLOCK_N, HALF_Q).reshape(BLOCK_M, HALF_BLOCK_N)
-    xx = (x1.to(tl.uint32, bitcast=True).to(tl.uint64) << 32) | x0.to(tl.uint32, bitcast=True)
-    y = tl.inline_asm_elementwise(
-        asm="v_cvt_scalef32_sr_pk_fp4_f32 $0, $1, $2, $3 op_sel:[0,0,0,0];",
-        constraints="=&v,v,v,v", args=[xx, rand, sf], dtype=tl.uint16, is_pure=True, pack=1)
+    if SR_BF16:
+        # benchmark switch: bf16 instruction on the bf16 pair (biased for |x| / scale < 2^-7)
+        x0, x1 = tl.split(x.to(tl.bfloat16).reshape(BLOCK_M, HALF_BLOCK_N, 2))
+        xx = (x1.to(tl.uint16, bitcast=True).to(tl.uint32) << 16) | x0.to(tl.uint16, bitcast=True)
+        y = tl.inline_asm_elementwise(
+            asm="v_cvt_scalef32_sr_pk_fp4_bf16 $0, $1, $2, $3 op_sel:[0,0,0,0];",
+            constraints="=&v,v,v,v", args=[xx, rand, sf], dtype=tl.uint16, is_pure=True, pack=1)
+    else:
+        x0, x1 = tl.split(x.to(tl.float32).reshape(BLOCK_M, HALF_BLOCK_N, 2))
+        xx = (x1.to(tl.uint32, bitcast=True).to(tl.uint64) << 32) | x0.to(tl.uint32, bitcast=True)
+        y = tl.inline_asm_elementwise(
+            asm="v_cvt_scalef32_sr_pk_fp4_f32 $0, $1, $2, $3 op_sel:[0,0,0,0];",
+            constraints="=&v,v,v,v", args=[xx, rand, sf], dtype=tl.uint16, is_pure=True, pack=1)
     return (y & 0x00FF).to(tl.uint8)
 
 

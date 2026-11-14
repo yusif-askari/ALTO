@@ -4,10 +4,17 @@
 
 from typing import Tuple, Optional
 from functools import lru_cache
+import os
+
 import torch
 from torch.library import triton_op, wrap_triton
 import triton
 import triton.language as tl
+
+# Benchmark switch (default off): stochastic rounding with the gfx950 bf16 instruction on bf16 input,
+# without the exact bf16 -> fp32 conversion. Faster in principle, but that instruction always rounds
+# |x| / scale < 2^-7 to zero (a bias toward zero), so it is not used for training.
+SR_BF16 = tl.constexpr(os.environ.get("ALTO_MXFP4_SR_BF16", "0") == "1")
 
 from alto.kernels.fp4.fp4_common import (
     make_dequantize_e2m1,
@@ -163,7 +170,7 @@ def _pack_fp4(
     SCALE_BLOCK_M: tl.constexpr = BLOCK_M // QUANT_BLOCK_SIZE
     SCALE_BLOCK_N: tl.constexpr = BLOCK_N // QUANT_BLOCK_SIZE
     x0, x1 = tl.split(x.reshape(BLOCK_M, HALF_BLOCK_N, 2))
-    if USE_SR and USE_ASM:
+    if USE_SR and USE_ASM and not SR_BF16:
         # The gfx950 bf16 stochastic-rounding conversion (v_cvt_scalef32_sr_pk_fp4_bf16) always rounds
         # |x| / scale < 2^-7 to zero (measured: P(round up) = 0 instead of 2|x|/scale), a bias toward zero.
         # bf16 -> fp32 is exact, and the fp32 instruction rounds these values without bias.
