@@ -33,16 +33,16 @@ def _configs():
             for m, n, k, w in shapes]
 
 
-@triton.autotune(configs=_configs(), key=["F", "K", "TP_BUCKET", "STORE_H"])
+@triton.autotune(configs=_configs(), key=["F", "K", "TP_BUCKET", "STORE_H", "ROW_MAP"])
 @triton.jit
 def _fc1_swiglu_quant_kernel(
-    xq_ptr, xs_ptr, w_ptr, ws_ptr, idx_ptr, p_ptr, had_ptr,
+    xq_ptr, xs_ptr, w_ptr, ws_ptr, idx_ptr, p_ptr, rows_ptr, had_ptr,
     y_ptr, qa_ptr, sa_ptr, qb_ptr, sb_ptr, hout_ptr,
     stride_we, stride_wn, stride_wse, stride_wsn,
     Tp, TP_BUCKET,
     F: tl.constexpr, K: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    SCALE_SELECTION: tl.constexpr, STORE_H: tl.constexpr,
+    SCALE_SELECTION: tl.constexpr, STORE_H: tl.constexpr, ROW_MAP: tl.constexpr,
 ):
     QB: tl.constexpr = 32
     KP: tl.constexpr = K // 2              # packed K
@@ -97,7 +97,12 @@ def _fc1_swiglu_quant_kernel(
     # silu(g) = g / (1 + exp(-g)) with libdevice exp, exactly as torch.compile (inductor) generates it for
     # Megatron's weighted SwiGLU, so h matches the unfused path bit for bit (g * tl.sigmoid(g) differs in
     # the last fp32 bit for ~6 in 10^6 elements).
-    p = tl.load(p_ptr + offs_m, mask=mask_m, other=0.0).to(tl.float32)
+    if ROW_MAP:
+        # probs in the unpadded token order: grouped row m holds token rows[m] (padding: rows[m] < 0, p = 0)
+        src = tl.load(rows_ptr + offs_m, mask=mask_m, other=-1)
+        p = tl.load(p_ptr + src, mask=src >= 0, other=0.0).to(tl.float32)
+    else:
+        p = tl.load(p_ptr + offs_m, mask=mask_m, other=0.0).to(tl.float32)
     gf = g.to(tl.float32)
     silu = gf / (libdevice.exp(-gf) + 1.0)
     h = ((silu * v.to(tl.float32)) * p[:, None]).to(tl.bfloat16)
@@ -135,12 +140,14 @@ def _fc1_swiglu_quant_kernel(
 
 
 def fc1_swiglu_quant(xq, xs, wq, ws, expert_indices, probs, hadamard, blockscale_selection="default",
-                     store_h=False):
+                     store_h=False, src_rows=None):
     """Fused routed fc1 + SwiGLU + fc2 input quantization.
 
     xq [Tp, K/2] uint8, xs [Tp, K/32] uint8: Q(x) along K (Tp = padded rows, segments 128-aligned)
     wq [E, 2F, K/2] uint8, ws [E, 2F/32, K/32] uint8: Q_tile(W1) (gate rows 0..F, value rows F..2F)
     expert_indices [Tp] int32, probs [Tp] (fp32 or bf16; 0 on padding rows), hadamard [32, 32]
+    src_rows [Tp] int32 (optional): token of each grouped row (< 0: padding); probs are then given in the
+    unpadded token order, probs [T] (no padded copy of the probs is needed)
     Returns y [Tp, 2F] bf16, qa [Tp, F/2], sa [Tp, F/32], qb [Tp/2, F] (view), sb [Tp/32, F] (view),
     and h [Tp, F] bf16 if store_h (tests only)."""
     Tp, KP = xq.shape
@@ -150,7 +157,8 @@ def fc1_swiglu_quant(xq, xs, wq, ws, expert_indices, probs, hadamard, blockscale
     F = F2 // 2
     assert Tp % ALIGN_SIZE_M == 0 and F % 32 == 0 and K % 32 == 0, (Tp, F, K)
     assert xq.is_contiguous() and xs.is_contiguous() and expert_indices.dtype == torch.int32
-    assert wq.stride(2) == 1 and ws.stride(2) == 1 and probs.shape[0] == Tp
+    assert wq.stride(2) == 1 and ws.stride(2) == 1
+    assert probs.shape[0] == Tp if src_rows is None else (src_rows.shape == (Tp,) and src_rows.dtype == torch.int32)
     dev = xq.device
     h_t = hadamard.to(device=dev, dtype=torch.bfloat16).contiguous()
     y = torch.empty((Tp, F2), dtype=torch.bfloat16, device=dev)
@@ -161,11 +169,11 @@ def fc1_swiglu_quant(xq, xs, wq, ws, expert_indices, probs, hadamard, blockscale
     hout = torch.empty((Tp, F), dtype=torch.bfloat16, device=dev) if store_h else y
     grid = lambda M: (triton.cdiv(Tp, M["BLOCK_M"]), triton.cdiv(F, M["BLOCK_N"]))
     _fc1_swiglu_quant_kernel[grid](
-        xq, xs, wq, ws, expert_indices, probs.contiguous(), h_t,
+        xq, xs, wq, ws, expert_indices, probs.contiguous(), src_rows if src_rows is not None else expert_indices, h_t,
         y, qa, sa, qb, sb, hout,
         wq.stride(0), wq.stride(1), ws.stride(0), ws.stride(1),
         Tp, triton.next_power_of_2(Tp),
-        F=F, K=K, SCALE_SELECTION=blockscale_selection, STORE_H=store_h,
+        F=F, K=K, SCALE_SELECTION=blockscale_selection, STORE_H=store_h, ROW_MAP=src_rows is not None,
     )
     out = (y, qa, sa, qb.t(), sb.t())
     return out + ((hout,) if store_h else ())
@@ -224,16 +232,16 @@ def _quant_pair_store(t, rand_a, rand_b, ht, col0, offs_m, mask_m, m0, n_cols, T
              mask=mask_c[:, None] & (offs_ms < Tp // QB)[None, :])
 
 
-@triton.autotune(configs=_bwd_configs(), key=["F", "D", "TP_BUCKET", "USE_SR"])
+@triton.autotune(configs=_bwd_configs(), key=["F", "D", "TP_BUCKET", "USE_SR", "ROW_MAP"])
 @triton.jit(do_not_specialize=["philox_seed", "philox_offset"])
 def _fc2_dgrad_swiglu_bwd_kernel(
-    dq_ptr, ds_ptr, w_ptr, ws_ptr, idx_ptr, y_ptr, p_ptr, had_ptr,
+    dq_ptr, ds_ptr, w_ptr, ws_ptr, idx_ptr, y_ptr, p_ptr, rows_ptr, had_ptr,
     gq_ptr, gs_ptr, gqt_ptr, gst_ptr, dpp_ptr, dy_ptr,
     stride_we, stride_wd, stride_wse, stride_wsd, stride_wsf,
-    philox_seed, philox_offset, Tp, TP_BUCKET,
+    philox_seed, philox_offset, Tp, TP_BUCKET, T_OUT,
     F: tl.constexpr, D: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr,
-    USE_SR: tl.constexpr, SCALE_SELECTION: tl.constexpr, STORE_DY: tl.constexpr,
+    USE_SR: tl.constexpr, SCALE_SELECTION: tl.constexpr, STORE_DY: tl.constexpr, ROW_MAP: tl.constexpr,
 ):
     QB: tl.constexpr = 32
     DP: tl.constexpr = D // 2
@@ -275,7 +283,11 @@ def _fc2_dgrad_swiglu_bwd_kernel(
     mask_mn = mask_m[:, None] & mask_n[None, :]
     g = tl.load(y_ptr + offs_m[:, None] * (2 * F) + offs_n[None, :], mask=mask_mn, other=0.0).to(tl.float32)
     v = tl.load(y_ptr + offs_m[:, None] * (2 * F) + (F + offs_n)[None, :], mask=mask_mn, other=0.0).to(tl.float32)
-    p = tl.load(p_ptr + offs_m, mask=mask_m, other=0.0)
+    if ROW_MAP:
+        src = tl.load(rows_ptr + offs_m, mask=mask_m, other=-1)
+        p = tl.load(p_ptr + src, mask=src >= 0, other=0.0)
+    else:
+        p = tl.load(p_ptr + offs_m, mask=mask_m, other=0.0)
     dhp = dh * p[:, None]
     s = tl.sigmoid(g)
     d_gate = ((dhp * s) * (g * (1.0 - s) + 1.0) * v).to(tl.bfloat16)
@@ -283,7 +295,10 @@ def _fc2_dgrad_swiglu_bwd_kernel(
     d_val = (dhp * silu).to(tl.bfloat16)
     # d(prob) partial sum over this tile's columns (summed over the column tiles on the host)
     dpp = tl.sum((silu * v) * dh, axis=1)
-    tl.store(dpp_ptr + pid_n * Tp + offs_m, dpp, mask=mask_m)
+    if ROW_MAP:
+        tl.store(dpp_ptr + pid_n * T_OUT + src, dpp, mask=src >= 0)       # unpadded token order
+    else:
+        tl.store(dpp_ptr + pid_n * Tp + offs_m, dpp, mask=mask_m)
     if STORE_DY:
         tl.store(dy_ptr + offs_m[:, None] * (2 * F) + offs_n[None, :], d_gate, mask=mask_mn)
         tl.store(dy_ptr + offs_m[:, None] * (2 * F) + (F + offs_n)[None, :], d_val, mask=mask_mn)
@@ -312,14 +327,16 @@ def _fc2_dgrad_swiglu_bwd_kernel(
 
 
 def fc2_dgrad_swiglu_bwd(dq, ds, w2q, w2s, expert_indices, y, probs, hadamard, use_sr=True,
-                         blockscale_selection="default", store_dy=False):
+                         blockscale_selection="default", store_dy=False, src_rows=None):
     """Fused routed fc2 dgrad + weighted SwiGLU backward + quantization of the fc1 gradient.
 
     dq [Tp, D/2], ds [Tp, D/32]: Q(dout) along D (fc2 output dim); w2q [E, D, F/2], w2s [E, D/32, F/32]:
     Q_tile(W2); y [Tp, 2F] bf16 (fc1 output saved by the forward); probs [Tp] fp32.
     Returns gq [Tp, F] (= 2F/2), gs [Tp, 2F/32], gq_t [Tp/2, 2F] (view), gs_t [Tp/32, 2F] (view):
     the fc1 output gradient dy1 quantized along 2F (fc1 dgrad) and, rotated, along tokens (fc1 wgrad);
-    and d(probs) [Tp] fp32; plus dy1 [Tp, 2F] bf16 if store_dy (tests only)."""
+    and d(probs) [Tp] fp32; plus dy1 [Tp, 2F] bf16 if store_dy (tests only).
+    src_rows [Tp] int32 (optional): token of each grouped row (< 0: padding); probs [T] and d(probs) [T]
+    are then in the unpadded token order."""
     Tp, DP = dq.shape
     D = 2 * DP
     E, Dw, FP = w2q.shape
@@ -333,17 +350,22 @@ def fc2_dgrad_swiglu_bwd(dq, ds, w2q, w2s, expert_indices, y, probs, hadamard, u
     gqt = torch.empty((2 * F, Tp // 2), dtype=torch.uint8, device=dev)
     gst = torch.empty((2 * F, Tp // 32), dtype=torch.uint8, device=dev)
     n_tiles_max = triton.cdiv(F, 32)
-    dpp = torch.zeros((n_tiles_max, Tp), dtype=torch.float32, device=dev)
+    t_out = probs.shape[0] if src_rows is not None else Tp
+    if src_rows is not None:
+        assert src_rows.shape == (Tp,) and src_rows.dtype == torch.int32 and src_rows.is_contiguous()
+    dpp = torch.zeros((n_tiles_max, t_out), dtype=torch.float32, device=dev)
     dy = torch.empty((Tp, 2 * F), dtype=torch.bfloat16, device=dev) if store_dy else y
     seed = torch.randint(0, 2**31 - 1, (1,)).item()
     offset = torch.randint(0, 2**30 - 1, (1,)).item()
     grid = lambda M: (triton.cdiv(Tp, M["BLOCK_M"]), triton.cdiv(F, M["BLOCK_N"]))
     _fc2_dgrad_swiglu_bwd_kernel[grid](
-        dq, ds, w2q, w2s, expert_indices, y, probs.contiguous().float(), h_t,
+        dq, ds, w2q, w2s, expert_indices, y, probs.contiguous().float(),
+        src_rows if src_rows is not None else expert_indices, h_t,
         gq, gs, gqt, gst, dpp, dy,
         w2q.stride(0), w2q.stride(1), w2s.stride(0), w2s.stride(1), w2s.stride(2),
-        seed, offset, Tp, triton.next_power_of_2(Tp),
+        seed, offset, Tp, triton.next_power_of_2(Tp), t_out,
         F=F, D=D, USE_SR=use_sr, SCALE_SELECTION=blockscale_selection, STORE_DY=store_dy,
+        ROW_MAP=src_rows is not None,
     )
     n_tiles = triton.cdiv(F, _fc2_dgrad_swiglu_bwd_kernel.best_config.kwargs["BLOCK_N"])
     out = (gq, gs, gqt.t(), gst.t(), dpp[:n_tiles].sum(0))

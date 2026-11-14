@@ -56,16 +56,16 @@ def _configs():
     return [triton.Config({"BLOCK_T": t, "BLOCK_C": c}, num_warps=w, num_stages=1) for t, c, w in shapes]
 
 
-@triton.autotune(configs=_configs(), key=["T_BUCKET", "C_BUCKET", "USE_SR", "SCALE_SELECTION"])
+@triton.autotune(configs=_configs(), key=["T_BUCKET", "C_BUCKET", "USE_SR", "SCALE_SELECTION", "ROW_MAP"])
 @triton.jit(do_not_specialize=["philox_seed", "philox_offset"])
 def _dual_quant_kernel(
-    x_ptr, h_ptr,
+    x_ptr, h_ptr, rows_ptr,
     qa_ptr, sa_ptr, qb_ptr, sb_ptr,
     stride_xt, stride_xc,
     philox_seed, philox_offset,
     T, C, T_BUCKET, C_BUCKET,
     BLOCK_T: tl.constexpr, BLOCK_C: tl.constexpr,
-    USE_SR: tl.constexpr, USE_ASM: tl.constexpr, SCALE_SELECTION: tl.constexpr,
+    USE_SR: tl.constexpr, USE_ASM: tl.constexpr, SCALE_SELECTION: tl.constexpr, ROW_MAP: tl.constexpr,
 ):
     QB: tl.constexpr = 32
     pid_t = tl.program_id(0)
@@ -74,8 +74,14 @@ def _dual_quant_kernel(
     offs_c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
     mask_t = offs_t < T
     mask_c = offs_c < C
-    x = tl.load(x_ptr + offs_t[:, None] * stride_xt + offs_c[None, :] * stride_xc,
-                mask=mask_t[:, None] & mask_c[None, :], other=0.0)
+    if ROW_MAP:
+        # row t of the (padded) quantized layout is row rows[t] of x, or a padding row (rows[t] < 0) read as 0
+        src = tl.load(rows_ptr + offs_t, mask=mask_t, other=-1)
+        x = tl.load(x_ptr + src.to(tl.int64)[:, None] * stride_xt + offs_c[None, :] * stride_xc,
+                    mask=(src >= 0)[:, None] & mask_c[None, :], other=0.0)
+    else:
+        x = tl.load(x_ptr + offs_t[:, None] * stride_xt + offs_c[None, :] * stride_xc,
+                    mask=mask_t[:, None] & mask_c[None, :], other=0.0)
 
     # independent Philox counter ranges for every tile and for the two outputs
     tile_elems = BLOCK_T * BLOCK_C // 2
@@ -137,11 +143,20 @@ def dual_quantize_supported(x: torch.Tensor) -> bool:
 
 
 def dual_quantize(x: torch.Tensor, hadamard: torch.Tensor, use_sr: bool = False,
-                  blockscale_selection: str = "default"):
+                  blockscale_selection: str = "default", src_rows: torch.Tensor = None):
     """x [T, C] bf16, hadamard [32, 32] (the matrix applied as H @ x_block). Returns
-    (qa [T, C/2], sa [T, C/32], qb [T/2, C] view, sb [T/32, C] view)."""
-    assert dual_quantize_supported(x), (x.shape, x.dtype)
-    T, C = x.shape
+    (qa [T, C/2], sa [T, C/32], qb [T/2, C] view, sb [T/32, C] view).
+
+    src_rows [Tp] int32 (optional): quantize the row-gathered tensor xp[t] = x[src_rows[t]] (0 where
+    src_rows[t] < 0) without writing it, e.g. x in Megatron's unpadded expert layout and xp ALTO's
+    128-aligned one; the outputs then have Tp rows, bit-identical to dual_quantize(xp)."""
+    if src_rows is not None:
+        assert src_rows.dtype == torch.int32 and src_rows.is_contiguous() and src_rows.shape[0] % 32 == 0
+        assert x.dim() == 2 and x.dtype == torch.bfloat16 and x.shape[1] % 32 == 0 and is_cdna4()
+        T, C = src_rows.shape[0], x.shape[1]
+    else:
+        assert dual_quantize_supported(x), (x.shape, x.dtype)
+        T, C = x.shape
     h = hadamard.to(device=x.device, dtype=x.dtype).contiguous()
     assert h.shape == (32, 32)
     qa = torch.empty((T, C // 2), dtype=torch.uint8, device=x.device)
@@ -152,8 +167,8 @@ def dual_quantize(x: torch.Tensor, hadamard: torch.Tensor, use_sr: bool = False,
     offset = torch.randint(0, 2**30 - 1, (1,)).item()
     grid = lambda META: (triton.cdiv(T, META["BLOCK_T"]), triton.cdiv(C, META["BLOCK_C"]))
     _dual_quant_kernel[grid](
-        x, h, qa, sa, qb, sb, x.stride(0), x.stride(1), seed, offset,
+        x, h, src_rows if src_rows is not None else x, qa, sa, qb, sb, x.stride(0), x.stride(1), seed, offset,
         T, C, triton.next_power_of_2(T), triton.next_power_of_2(C),
-        USE_SR=use_sr, USE_ASM=True, SCALE_SELECTION=blockscale_selection,
+        USE_SR=use_sr, USE_ASM=True, SCALE_SELECTION=blockscale_selection, ROW_MAP=src_rows is not None,
     )
     return qa, sa, qb.t(), sb.t()

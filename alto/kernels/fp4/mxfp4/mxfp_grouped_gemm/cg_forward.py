@@ -7,6 +7,8 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause AND MIT
 
+from typing import Optional
+
 import torch
 from torch.library import triton_op, wrap_triton
 import triton
@@ -38,6 +40,7 @@ def _compute_pid(tile_id, num_pid_in_group, num_pid_m, super_group_m):
         "USE_2DBLOCK_A",
         "USE_2DBLOCK_B",
         "QUANT_BLOCK_SIZE",
+        "OUT_ROW_MAP",
     ],
 )
 @triton.jit
@@ -76,6 +79,9 @@ def _kernel_mxfp4_grouped_gemm_forward(
         USE_2DBLOCK_A: tl.constexpr,
         USE_2DBLOCK_B: tl.constexpr,
         QUANT_BLOCK_SIZE: tl.constexpr,
+        # output row map: row m of the grouped layout is stored to row out_rows[m] of C (not stored if < 0)
+        out_rows_ptr,
+        OUT_ROW_MAP: tl.constexpr,
         # Group size (for aligned loads)
         GROUP_SIZE_M: tl.constexpr = 128,
         SUPER_GROUP_M: tl.constexpr = 32,  # 32 works best
@@ -190,7 +196,12 @@ def _kernel_mxfp4_grouped_gemm_forward(
             mask_c = mask_m[:, None] & mask_n[None, :]
 
             # Store output (C) with bounds checking
-            c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+            if OUT_ROW_MAP:
+                dst = tl.load(out_rows_ptr + offs_m, mask=mask_m, other=-1)
+                c_ptrs = c_ptr + dst.to(tl.int64)[:, None] * stride_cm + offs_n[None, :] * stride_cn
+                mask_c = mask_c & (dst >= 0)[:, None]
+            else:
+                c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
             tl.store(c_ptrs, accumulator.to(c_type), mask=mask_c)
 
 
@@ -208,9 +219,14 @@ def mxfp4_grouped_gemm_forward(
     use_2dblock_x: bool = False,
     use_2dblock_w: bool = True,
     output_dtype: torch.dtype = torch.bfloat16,
+    out_rows: Optional[torch.Tensor] = None,
+    out_len: int = 0,
 ) -> torch.Tensor:
     """
     contiguous grouped GEMM forward pass for MoE.
+    out_rows [M_total] int32 (optional): store row m of the result to row out_rows[m] of an [out_len, N]
+    output and drop rows with out_rows[m] < 0 (the padding rows), i.e. write Megatron's unpadded layout
+    directly instead of returning the padded result for a separate gather.
     All tokens mapped to the same expert must be in contiguous blocks of size group_size_m.
 
     Args:
@@ -257,7 +273,12 @@ def mxfp4_grouped_gemm_forward(
     # ), f"Expert indices length ({expert_indices.shape[0]}) must match M_total ({M_total})"
 
     # Create output tensor
-    output = torch.zeros((M_bufferlen, N), device=inputs.device, dtype=output_dtype)
+    if out_rows is not None:
+        assert out_rows.dtype == torch.int32 and out_rows.is_contiguous() and out_rows.shape[0] == M_total
+        # every output row is the image of exactly one grouped row: no initialisation needed
+        output = torch.empty((out_len, N), device=inputs.device, dtype=output_dtype)
+    else:
+        output = torch.zeros((M_bufferlen, N), device=inputs.device, dtype=output_dtype)
 
     stride_am, stride_ak = inputs.stride()
     stride_asm, stride_ask = input_scales.stride()
@@ -298,6 +319,8 @@ def mxfp4_grouped_gemm_forward(
         USE_2DBLOCK_A=use_2dblock_x,
         USE_2DBLOCK_B=use_2dblock_w,
         QUANT_BLOCK_SIZE=BLOCK_SIZE_DEFAULT,
+        out_rows_ptr=out_rows if out_rows is not None else expert_indices,
+        OUT_ROW_MAP=out_rows is not None,
     )
 
     return output

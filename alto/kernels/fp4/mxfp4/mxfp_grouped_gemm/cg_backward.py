@@ -62,6 +62,7 @@ from ...fp4_common.tensor_wrappers import unwrap_weight_wrapper
         "USE_2DBLOCK_GO",
         "USE_2DBLOCK_B",
         "QUANT_BLOCK_SIZE",
+        "OUT_ROW_MAP",
     ],
 )
 @triton.jit
@@ -99,6 +100,9 @@ def _kernel_mxfp4_grouped_gemm_backward_dx(
     USE_2DBLOCK_GO: tl.constexpr,
     USE_2DBLOCK_B: tl.constexpr,
     QUANT_BLOCK_SIZE: tl.constexpr,
+    # output row map: row m of the grouped layout is stored to row out_rows[m] (not stored if < 0)
+    out_rows_ptr,
+    OUT_ROW_MAP: tl.constexpr,
     # Group size (for aligned loads)
     GROUP_SIZE_M: tl.constexpr = 128,
 ):
@@ -213,8 +217,13 @@ def _kernel_mxfp4_grouped_gemm_backward_dx(
                                         out_dtype=tl.float32)
 
         # Store results with bounds checking
-        grad_input_ptrs = (grad_input_ptr + offs_m[:, None] * stride_gim + offs_k[None, :] * stride_gik)
         mask_gi = mask_m[:, None] & mask_k[None, :]
+        if OUT_ROW_MAP:
+            dst = tl.load(out_rows_ptr + offs_m, mask=mask_m, other=-1)
+            grad_input_ptrs = (grad_input_ptr + dst.to(tl.int64)[:, None] * stride_gim + offs_k[None, :] * stride_gik)
+            mask_gi = mask_gi & (dst >= 0)[:, None]
+        else:
+            grad_input_ptrs = (grad_input_ptr + offs_m[:, None] * stride_gim + offs_k[None, :] * stride_gik)
         tl.store(grad_input_ptrs, grad_input, mask=mask_gi)
 
 
@@ -571,9 +580,13 @@ def mxfp4_grouped_gemm_backward_inputs(
     use_2dblock_w: bool = True,
     k_pack_w: bool = True,
     output_dtype: torch.dtype = torch.bfloat16,
+    out_rows: Optional[torch.Tensor] = None,
+    out_len: int = 0,
 ) -> torch.Tensor:
     """
     Backward pass for contiguous grouped GEMM with respect to inputs.
+    out_rows [M_total] int32 (optional): write row m to row out_rows[m] of an [out_len, K] result,
+    dropping rows with out_rows[m] < 0 (see mxfp4_grouped_gemm_forward).
 
     Args:
         grad_output: Gradient from output, shape [M_total, N]
@@ -614,7 +627,11 @@ def mxfp4_grouped_gemm_backward_inputs(
     assert (M_total % ALIGN_SIZE_M == 0), f"M_total ({M_total}) must be a multiple of group_size_m ({ALIGN_SIZE_M})"
 
     # Create output tensor for gradients
-    grad_inputs = torch.zeros((M_bufferlen, K), device=grad_output.device, dtype=output_dtype)
+    if out_rows is not None:
+        assert out_rows.dtype == torch.int32 and out_rows.is_contiguous() and out_rows.shape[0] == M_total
+        grad_inputs = torch.empty((out_len, K), device=grad_output.device, dtype=output_dtype)
+    else:
+        grad_inputs = torch.zeros((M_bufferlen, K), device=grad_output.device, dtype=output_dtype)
     stride_gom, stride_gon = grad_output.stride()
     stride_gosm, stride_gosn = go_scales.stride()
     stride_gim, stride_gik = grad_inputs.stride()
@@ -651,6 +668,8 @@ def mxfp4_grouped_gemm_backward_inputs(
         USE_2DBLOCK_GO=use_2dblock_x,
         USE_2DBLOCK_B=use_2dblock_w,
         QUANT_BLOCK_SIZE=BLOCK_SIZE_DEFAULT,
+        out_rows_ptr=out_rows if out_rows is not None else expert_indices,
+        OUT_ROW_MAP=out_rows is not None,
     )
     return grad_inputs
 
