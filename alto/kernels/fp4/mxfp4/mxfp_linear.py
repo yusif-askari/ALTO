@@ -29,6 +29,7 @@ from .mxfp_quantization import (
 from .macro_block_scaling import macro_block_scaling, macro_block_descaling
 from alto.kernels.fp4.mxfp4._eager_ops import ops
 from alto.kernels.fp4.mxfp4.mxfp_dual_quant import dual_quantize, dual_quantize_supported
+from alto.kernels.fp4.mxfp4 import mxfp_weight_cache
 import os as _os
 
 # Fused quantization (one pass over x / dy for both operands, Hadamard inside the kernel); set
@@ -347,12 +348,19 @@ class MXFP4LinearFunction(torch.autograd.Function):
                 blockscale_selection=blockscale_selection,
             )
 
-        w_mxfp4, w_scale = ops.convert_to_mxfp4(
-            w_scaled,
-            axis=-1,
-            is_2d_block=use_2dblock_w,
-            blockscale_selection=blockscale_selection,
-        )
+        if w_scaled is weight:
+            # plain weight (no Hadamard on the forward weight, no macro-block scaling): reusable within a step
+            w_mxfp4, w_scale = mxfp_weight_cache.cached_quantize(
+                weight, ("linear_fwd", use_2dblock_w, blockscale_selection),
+                lambda: ops.convert_to_mxfp4(weight, axis=-1, is_2d_block=use_2dblock_w,
+                                             blockscale_selection=blockscale_selection))
+        else:
+            w_mxfp4, w_scale = ops.convert_to_mxfp4(
+                w_scaled,
+                axis=-1,
+                is_2d_block=use_2dblock_w,
+                blockscale_selection=blockscale_selection,
+            )
 
         if is_cdna4():
             assert not use_macro_block_scaling, "Macro block scaling is not supported in real MXFP4 kernels"

@@ -23,6 +23,24 @@ import triton.language as tl
 from .mxfp_quantization import _calculate_scales, _pack_fp4, is_cdna4
 
 
+@triton.jit
+def _pack_fp4_sr(x, scales, rand, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, QUANT_BLOCK_SIZE: tl.constexpr):
+    """Stochastic rounding to e2m1 with the gfx950 instruction, one given 32-bit random number per packed pair
+    (rand [BLOCK_M, BLOCK_N/2]); 1-D blocks along the last axis. Same instruction and operand layout as ALTO's
+    _pack_fp4 (USE_SR, USE_ASM, fp32 input), which draws its own random numbers."""
+    HALF_BLOCK_N: tl.constexpr = BLOCK_N // 2
+    SCALE_BLOCK_N: tl.constexpr = BLOCK_N // QUANT_BLOCK_SIZE
+    HALF_Q: tl.constexpr = QUANT_BLOCK_SIZE // 2
+    x0, x1 = tl.split(x.to(tl.float32).reshape(BLOCK_M, HALF_BLOCK_N, 2))
+    sf = (scales.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
+    sf = sf.expand_dims(axis=2).broadcast_to(BLOCK_M, SCALE_BLOCK_N, HALF_Q).reshape(BLOCK_M, HALF_BLOCK_N)
+    xx = (x1.to(tl.uint32, bitcast=True).to(tl.uint64) << 32) | x0.to(tl.uint32, bitcast=True)
+    y = tl.inline_asm_elementwise(
+        asm="v_cvt_scalef32_sr_pk_fp4_f32 $0, $1, $2, $3 op_sel:[0,0,0,0];",
+        constraints="=&v,v,v,v", args=[xx, rand, sf], dtype=tl.uint16, is_pure=True, pack=1)
+    return (y & 0x00FF).to(tl.uint8)
+
+
 def _configs():
     shapes = [(64, 64, 4), (64, 128, 4), (128, 64, 4), (128, 128, 8), (32, 128, 4), (128, 32, 4)]
     return [triton.Config({"BLOCK_T": t, "BLOCK_C": c}, num_warps=w, num_stages=1) for t, c, w in shapes]
@@ -55,12 +73,24 @@ def _dual_quant_kernel(
     n_tiles = tl.num_programs(0) * tl.num_programs(1)
     off_a = philox_offset + tile_id * tile_elems
     off_b = philox_offset + (n_tiles + tile_id) * tile_elems
+    if USE_SR and USE_ASM:
+        # one Philox call gives 4 random 32-bit values: enough for 4 packed pairs, 2 of each output (ALTO's
+        # _pack_fp4 calls Philox once per pair per output and keeps 2 of the 4 values, 1 of which is used)
+        q_elems: tl.constexpr = BLOCK_T * BLOCK_C // 4
+        roffs = philox_offset + tile_id * q_elems + \
+            tl.arange(0, BLOCK_T)[:, None] * (BLOCK_C // 4) + tl.arange(0, BLOCK_C // 4)[None, :]
+        r1, r2, r3, r4 = tl.randint4x(philox_seed, roffs)
+        rand_a = tl.join(r1, r2).reshape(BLOCK_T, BLOCK_C // 2)
+        rand_b = tl.join(r3, r4).reshape(BLOCK_C, BLOCK_T // 2)
 
     # ---- A: quantize along C (rows = tokens, blocks of 32 features)
     sa = _calculate_scales(x, BLOCK_M=BLOCK_T, BLOCK_N=BLOCK_C, QUANT_BLOCK_SIZE=QB, IS_2D_BLOCK=False,
                            USE_DYNAMIC_CLIP=False, SCALE_SELECTION=SCALE_SELECTION)
-    qa = _pack_fp4(x, sa, philox_seed, off_a, BLOCK_M=BLOCK_T, BLOCK_N=BLOCK_C, QUANT_BLOCK_SIZE=QB,
-                   IS_2D_BLOCK=False, USE_SR=USE_SR, USE_ASM=USE_ASM)
+    if USE_SR and USE_ASM:
+        qa = _pack_fp4_sr(x, sa, rand_a, BLOCK_M=BLOCK_T, BLOCK_N=BLOCK_C, QUANT_BLOCK_SIZE=QB)
+    else:
+        qa = _pack_fp4(x, sa, philox_seed, off_a, BLOCK_M=BLOCK_T, BLOCK_N=BLOCK_C, QUANT_BLOCK_SIZE=QB,
+                       IS_2D_BLOCK=False, USE_SR=USE_SR, USE_ASM=USE_ASM)
     offs_c2 = pid_c * (BLOCK_C // 2) + tl.arange(0, BLOCK_C // 2)
     offs_cs = pid_c * (BLOCK_C // QB) + tl.arange(0, BLOCK_C // QB)
     tl.store(qa_ptr + offs_t[:, None] * (C // 2) + offs_c2[None, :], qa,
@@ -78,8 +108,11 @@ def _dual_quant_kernel(
     r = tl.reshape(r.to(x.dtype), (BLOCK_C, BLOCK_T))
     sb = _calculate_scales(r, BLOCK_M=BLOCK_C, BLOCK_N=BLOCK_T, QUANT_BLOCK_SIZE=QB, IS_2D_BLOCK=False,
                            USE_DYNAMIC_CLIP=False, SCALE_SELECTION=SCALE_SELECTION)
-    qb = _pack_fp4(r, sb, philox_seed, off_b, BLOCK_M=BLOCK_C, BLOCK_N=BLOCK_T, QUANT_BLOCK_SIZE=QB,
-                   IS_2D_BLOCK=False, USE_SR=USE_SR, USE_ASM=USE_ASM)
+    if USE_SR and USE_ASM:
+        qb = _pack_fp4_sr(r, sb, rand_b, BLOCK_M=BLOCK_C, BLOCK_N=BLOCK_T, QUANT_BLOCK_SIZE=QB)
+    else:
+        qb = _pack_fp4(r, sb, philox_seed, off_b, BLOCK_M=BLOCK_C, BLOCK_N=BLOCK_T, QUANT_BLOCK_SIZE=QB,
+                       IS_2D_BLOCK=False, USE_SR=USE_SR, USE_ASM=USE_ASM)
     offs_t2 = pid_t * (BLOCK_T // 2) + tl.arange(0, BLOCK_T // 2)
     offs_ts = pid_t * (BLOCK_T // QB) + tl.arange(0, BLOCK_T // QB)
     tl.store(qb_ptr + offs_c[:, None] * (T // 2) + offs_t2[None, :], qb,

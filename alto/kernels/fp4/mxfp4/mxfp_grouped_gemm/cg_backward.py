@@ -36,6 +36,7 @@ from alto.kernels.hadamard_transform.transform import (HadamardFactory, Hadamard
 from alto.kernels.fp4.mxfp4._eager_ops import ops
 from alto.kernels.fp4.mxfp4.mxfp_linear import _fused_ok
 from alto.kernels.fp4.mxfp4.mxfp_dual_quant import dual_quantize, dual_quantize_supported
+from alto.kernels.fp4.mxfp4 import mxfp_weight_cache
 from alto.kernels.fp4.mxfp4.mxfp_grouped_gemm.wgrad_segmented import _wgrad_seg_kernel, segment_offsets
 from ..macro_block_scaling import macro_block_scaling, macro_block_descaling
 from ...fp4_common.tensor_wrappers import unwrap_weight_wrapper
@@ -692,12 +693,19 @@ class MXFP4GroupedGEMM(torch.autograd.Function):
                 is_2d_block=use_2dblock_x,
                 blockscale_selection=blockscale_selection,
             )
-        expert_weights_mxfp4, expert_weight_scales = ops.convert_to_mxfp4(
-            expert_weights_scaled,
-            axis=quant_axis_w,
-            is_2d_block=use_2dblock_w,
-            blockscale_selection=blockscale_selection,
-        )
+        if expert_weights_scaled is expert_weights:
+            # plain weights (no Hadamard on the forward weight, no macro-block scaling): reusable within a step
+            expert_weights_mxfp4, expert_weight_scales = mxfp_weight_cache.cached_quantize(
+                expert_weights, ("grouped_fwd", quant_axis_w, use_2dblock_w, blockscale_selection),
+                lambda: ops.convert_to_mxfp4(expert_weights, axis=quant_axis_w, is_2d_block=use_2dblock_w,
+                                             blockscale_selection=blockscale_selection))
+        else:
+            expert_weights_mxfp4, expert_weight_scales = ops.convert_to_mxfp4(
+                expert_weights_scaled,
+                axis=quant_axis_w,
+                is_2d_block=use_2dblock_w,
+                blockscale_selection=blockscale_selection,
+            )
 
         if is_cdna4():
             assert not use_macro_block_scaling, "Macro block scaling is not supported in real MXFP4 kernels"
